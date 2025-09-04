@@ -393,6 +393,18 @@ textarea {
   text-align: center;
 }
 
+.app-footer {
+  text-align: center;
+  padding: 1.5rem 1rem;
+  margin-top: auto; /* Pushes footer to the bottom of the flex container */
+  color: var(--light-text-color);
+  font-size: 0.9rem;
+}
+
+.app-footer p {
+  margin: 0;
+}
+
 @media (max-width: 1200px) {
   .main-container {
     flex-direction: column;
