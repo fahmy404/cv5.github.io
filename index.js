@@ -90,7 +90,7 @@ try {
 
 /**
  * A wrapper for the Gemini API call that includes retry logic with exponential backoff.
- * This makes the application more resilient to 429 rate limit errors.
+ * This makes the application more resilient to 429 (rate limit) and 503 (overloaded) errors.
  */
 const generateContentWithRetry = async (ai, params, retries = 4, initialDelay = 2000) => {
     let attempt = 0;
@@ -100,11 +100,19 @@ const generateContentWithRetry = async (ai, params, retries = 4, initialDelay = 
             return await ai.models.generateContent(params);
         } catch (e) {
             attempt++;
-            const isRateLimitError = e instanceof Error && (e.message.includes('429') || e.message.toLowerCase().includes('resource_exhausted'));
             
-            if (isRateLimitError && attempt < retries) {
+            // Convert error to a string for robust checking, as the error type can vary.
+            const errorMessage = (e instanceof Error) ? e.message : JSON.stringify(e);
+            
+            const isRetriable = 
+                errorMessage.includes('429') || // Too Many Requests (Rate limit)
+                errorMessage.includes('503') || // Service Unavailable (Overloaded)
+                errorMessage.toLowerCase().includes('resource_exhausted') ||
+                errorMessage.toLowerCase().includes('overloaded');
+
+            if (isRetriable && attempt < retries) {
                 const jitter = Math.random() * 1000;
-                console.warn(`Rate limit hit. Retrying in ${(delay + jitter) / 1000}s... (Attempt ${attempt})`);
+                console.warn(`Retriable error detected. Retrying in ${(delay + jitter) / 1000}s... (Attempt ${attempt})`, e);
                 await new Promise(resolve => setTimeout(resolve, delay + jitter));
                 delay *= 2; // Exponential backoff
             } else {
@@ -205,10 +213,11 @@ const App = () => {
     } catch (e) {
       console.error(`Error analyzing ${file.name}:`, e);
       let errorMessage = T.analysisError(file.name);
-      if (e instanceof Error && e.message.includes('429')) {
-          errorMessage += ' (API rate limit exceeded. The process was stopped.)';
+      const errorString = (e instanceof Error) ? e.message : JSON.stringify(e);
+      if (errorString.includes('429') || errorString.includes('503') || errorString.toLowerCase().includes('overloaded')) {
+          errorMessage += ' (The AI service is temporarily overloaded. Please try again in a few moments).';
       }
-      setError(errorMessage);
+      setError(prev => prev ? `${prev}\n${errorMessage}` : errorMessage);
       return null;
     }
   };
@@ -222,7 +231,6 @@ const App = () => {
     setError('');
     setStatusMessage(T.prepareFiles);
 
-    // Clean up URLs from previous session
     blobUrlsRef.current.forEach(URL.revokeObjectURL);
     blobUrlsRef.current = [];
     setResumes([]);
@@ -236,8 +244,7 @@ const App = () => {
             for (const filename in zip.files) {
                 if (!zip.files[filename].dir && supportedExtensions.some(ext => filename.toLowerCase().endsWith(ext))) {
                     const blob = await zip.files[filename].async('blob');
-                    const newFile = new File([blob], filename);
-                    allFiles.push(newFile);
+                    allFiles.push(new File([blob], filename));
                 }
             }
         } else if (supportedExtensions.some(ext => file.name.toLowerCase().endsWith(ext))) {
@@ -245,43 +252,55 @@ const App = () => {
         }
     }
     
-    let analyzedResumesCount = 0;
-    const uniqueIdentifiers = new Set();
+    const CONCURRENCY_LIMIT = 5;
+    let processedCount = 0;
+    const analysisResults = [];
+    const processQueue = [...allFiles];
     
-    for (let i = 0; i < allFiles.length; i++) {
-        const file = allFiles[i];
-        setStatusMessage(T.analyzingStatus(i + 1, allFiles.length));
+    setStatusMessage(T.analyzingStatus(0, allFiles.length));
 
-        const analysisData = await analyzeResume(file);
-        
-        if (analysisData) {
-            analyzedResumesCount++;
-            const blobUrl = URL.createObjectURL(file);
-            blobUrlsRef.current.push(blobUrl);
-            const resumeWithUrl = { ...analysisData, fileURL: blobUrl, fileType: file.type, fileName: file.name };
-            
-            const identifier = `${(resumeWithUrl.name || '').toLowerCase()}|${(resumeWithUrl.email || '').toLowerCase()}`;
+    const worker = async () => {
+        while (processQueue.length > 0) {
+            const file = processQueue.shift();
+            if (file) {
+                const analysisData = await analyzeResume(file);
+                
+                processedCount++;
+                setStatusMessage(T.analyzingStatus(processedCount, allFiles.length));
+
+                if (analysisData) {
+                    const blobUrl = URL.createObjectURL(file);
+                    blobUrlsRef.current.push(blobUrl);
+                    analysisResults.push({ ...analysisData, fileURL: blobUrl, fileType: file.type, fileName: file.name });
+                }
+            }
+        }
+    };
+    
+    try {
+        const workers = Array(CONCURRENCY_LIMIT).fill(null).map(worker);
+        await Promise.all(workers);
+
+        const uniqueResumes = [];
+        const uniqueIdentifiers = new Set();
+        for (const resume of analysisResults) {
+            const identifier = `${(resume.name || '').toLowerCase()}|${(resume.email || '').toLowerCase()}`;
             if (!uniqueIdentifiers.has(identifier)) {
                 uniqueIdentifiers.add(identifier);
-                setResumes(prev => [...prev, resumeWithUrl]);
+                uniqueResumes.push(resume);
             }
-        } else {
-          // Stop processing if an error occurred to avoid cascading failures
-          setIsLoading(false);
-          return;
         }
+        setResumes(uniqueResumes);
 
-        // Wait for 1 second between requests to avoid rate limiting
-        if (i < allFiles.length - 1) {
-             await new Promise(resolve => setTimeout(resolve, 1000));
-        }
+        const uniqueCount = uniqueResumes.length;
+        const duplicateCount = analysisResults.length - uniqueCount;
+        setStatusMessage(T.analysisComplete(uniqueCount, duplicateCount));
+
+    } catch (e) {
+        console.error("Analysis process stopped due to a critical error.", e);
+    } finally {
+        setIsLoading(false);
     }
-
-    const uniqueCount = uniqueIdentifiers.size;
-    const duplicateCount = analyzedResumesCount - uniqueCount;
-
-    setStatusMessage(T.analysisComplete(uniqueCount, duplicateCount));
-    setIsLoading(false);
   }, [T]);
     
   const handleDragEvents = (e) => {
@@ -318,10 +337,15 @@ const App = () => {
     setIsLoading(true);
     setError('');
     
-    for (let i = 0; i < resumes.length; i++) {
-        const resume = resumes[i];
-        setStatusMessage(T.matchingStatus(i + 1, resumes.length));
-        let matchScore = 0;
+    const CONCURRENCY_LIMIT = 5;
+    let processedCount = 0;
+    const resumesToMatch = [...resumes];
+    const updatedResumes = [];
+    const processQueue = [...resumesToMatch];
+    
+    setStatusMessage(T.matchingStatus(0, resumes.length));
+    
+    const matchSingleResume = async (resume) => {
         try {
             const prompt = `
                 Job Description: "${jobDescription}"
@@ -346,33 +370,51 @@ const App = () => {
                     }
                 }
             });
-            matchScore = JSON.parse(result.text).matchScore;
+            const matchScore = JSON.parse(result.text).matchScore;
+            return { ...resume, matchScore };
         } catch (e) {
-            console.error('Error matching resume:', e);
+            console.error(`Error matching ${resume.name}:`, e);
             let errorMessage = `Error matching candidate: ${resume.name}.`;
-             if (e instanceof Error && e.message.includes('429')) {
-                errorMessage += ' (API rate limit exceeded. The process was stopped.)';
-             }
-            setError(errorMessage);
-            setIsLoading(false);
-            return;
+            const errorString = (e instanceof Error) ? e.message : JSON.stringify(e);
+            if (errorString.includes('429') || errorString.includes('503') || errorString.toLowerCase().includes('overloaded')) {
+                errorMessage += ' (The AI service is temporarily overloaded. Please try again in a few moments).';
+            }
+            setError(prev => prev ? `${prev}\n${errorMessage}` : errorMessage);
+            return null;
         }
+    };
 
-        setResumes(currentResumes => {
-            const updated = currentResumes.map(r => 
-                r.id === resume.id ? { ...r, matchScore } : r
-            );
-            return updated.sort((a, b) => (b.matchScore ?? -1) - (a.matchScore ?? -1));
-        });
-
-        // Wait for 1 second between requests to avoid rate limiting
-        if (i < resumes.length - 1) {
-            await new Promise(resolve => setTimeout(resolve, 1000));
+    const worker = async () => {
+        while (processQueue.length > 0) {
+            const resume = processQueue.shift();
+            if (resume) {
+                const updatedResume = await matchSingleResume(resume);
+                if (updatedResume) {
+                    updatedResumes.push(updatedResume);
+                }
+                processedCount++;
+                setStatusMessage(T.matchingStatus(processedCount, resumesToMatch.length));
+            }
         }
-    }
+    };
     
-    setIsLoading(false);
-    setStatusMessage(T.matchComplete);
+    try {
+        const workers = Array(CONCURRENCY_LIMIT).fill(null).map(worker);
+        await Promise.all(workers);
+        
+        const finalResumes = resumes.map(original => {
+            const updated = updatedResumes.find(u => u.id === original.id);
+            return updated || { ...original, matchScore: original.matchScore ?? 0 };
+        }).sort((a, b) => (b.matchScore ?? -1) - (a.matchScore ?? -1));
+
+        setResumes(finalResumes);
+        setStatusMessage(T.matchComplete);
+
+    } catch(e) {
+        console.error('A critical error occurred during the matching process:', e);
+    } finally {
+        setIsLoading(false);
+    }
   };
 
   const switchLanguage = (newLang) => {
@@ -474,7 +516,7 @@ const App = () => {
                   ${T.matchButton}
               </button>
           </div>
-          ${error && html`<div class="error-message">${error}</div>`}
+          ${error && html`<div class="error-message" style="white-space: pre-wrap;">${error}</div>`}
         </div>
 
         <div class="results-panel">
